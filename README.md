@@ -8,10 +8,12 @@
 
 ```text
 Conv/
+├── .gitignore             # 忽略本地 ZGEMM 参考目录
 ├── AGENTS.md              # 赛事约束及开发、验证、提交规范
 ├── README.md              # 仓库总览（本文件）
 ├── docs/
-│   └── optimization-report.md  # 优化方法、测试数据及性能报告
+│   ├── optimization-report.md  # 2026-08-27 12:00–18:00 全阶段报告
+│   └── 2026-08-27-Conv高性能计算优化流程和结论.md  # 同时段 SME 分析与实验复盘
 ├── conv_init/             # 官方初版备份，只读，不进行优化修改
 │   ├── README.md          # 原始 CONV 赛题说明
 │   ├── bench_conv.c       # 原始测试与性能评测程序
@@ -25,7 +27,7 @@ Conv/
 
 后续如需加入提交脚本、测试记录或优化说明，应放在 `conv/` 中或根目录下新建用途明确的目录，不得污染 `conv_init/`。
 
-当前优化过程、正确性验证和性能数据见 [`docs/optimization-report.md`](./docs/optimization-report.md)。
+当前优化过程、正确性验证和性能数据见 [`docs/optimization-report.md`](./docs/optimization-report.md)。本轮 SME 优化的 AI 判断、成功路径、失败实验、瓶颈分析、扩展能力和后续方向见 [`docs/2026-08-27-Conv高性能计算优化流程和结论.md`](./docs/2026-08-27-Conv高性能计算优化流程和结论.md)。
 
 ## 目录用途
 
@@ -76,11 +78,18 @@ OMP_NUM_THREADS=38 numactl -N 1 ./conv2d_test 6390 4256 81 81 1
 
 评测限制为单一 NUMA 节点、最多 38 个 CPU 核心。完整规则、正确性要求和提交注意事项以 [`AGENTS.md`](./AGENTS.md) 及官方最新通知为准。
 
-在支持 512 位 SVE 的官方鲲鹏环境中，可直接执行：
+在支持 512 位 SVE/SME 的官方鲲鹏环境中，可直接执行：
 
 ```sh
 cd conv
 bash run.sh
+```
+
+`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对 `conv2d.c` 启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；GCC 模式保留显式 SVE 回退。默认绑定 NUMA 7，编译器和节点均可显式切换：
+
+```sh
+COMPILER=bisheng NUMA_NODE=7 bash run.sh
+COMPILER=gcc NUMA_NODE=7 bash run.sh
 ```
 
 ## 建议工作流程
