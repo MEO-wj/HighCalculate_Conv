@@ -10,6 +10,8 @@
 Conv/
 ├── AGENTS.md              # 赛事约束及开发、验证、提交规范
 ├── README.md              # 仓库总览（本文件）
+├── docs/
+│   └── optimization-report.md  # 优化方法、测试数据及性能报告
 ├── conv_init/             # 官方初版备份，只读，不进行优化修改
 │   ├── README.md          # 原始 CONV 赛题说明
 │   ├── bench_conv.c       # 原始测试与性能评测程序
@@ -17,10 +19,13 @@ Conv/
 └── conv/                  # 实际优化工作目录
     ├── README.md          # CONV 赛题说明副本
     ├── bench_conv.c       # 测试程序副本，仍然禁止修改
-    └── conv2d.c           # 实际进行性能优化的核心代码
+    ├── conv2d.c           # 实际进行性能优化的核心代码
+    └── run.sh             # 官方环境一键编译和运行脚本
 ```
 
 后续如需加入提交脚本、测试记录或优化说明，应放在 `conv/` 中或根目录下新建用途明确的目录，不得污染 `conv_init/`。
+
+当前优化过程、正确性验证和性能数据见 [`docs/optimization-report.md`](./docs/optimization-report.md)。
 
 ## 目录用途
 
@@ -41,7 +46,7 @@ Conv/
 
 - 主要修改目标为 `conv/conv2d.c` 中的 `conv2d` 函数；
 - `conv/bench_conv.c` 是测试程序，不得修改；
-- 提交所需的 `run.sh` 后续应创建在 `conv/` 根部；
+- `conv/run.sh` 使用官方鲲鹏环境验证过的编译参数完成编译和四项测试；
 - 每次优化都必须先通过正确性验证，再比较性能。
 
 仓库整理完成时，`conv/` 与 `conv_init/` 中的三份初始文件内容完全一致。之后两者出现的差异应只来自 `conv/` 中经过验证的优化及提交辅助文件。
@@ -71,6 +76,13 @@ OMP_NUM_THREADS=38 numactl -N 1 ./conv2d_test 6390 4256 81 81 1
 
 评测限制为单一 NUMA 节点、最多 38 个 CPU 核心。完整规则、正确性要求和提交注意事项以 [`AGENTS.md`](./AGENTS.md) 及官方最新通知为准。
 
+在支持 512 位 SVE 的官方鲲鹏环境中，可直接执行：
+
+```sh
+cd conv
+bash run.sh
+```
+
 ## 建议工作流程
 
 1. 使用 `conv_init/` 建立并保存初始性能基线。
@@ -78,5 +90,4 @@ OMP_NUM_THREADS=38 numactl -N 1 ./conv2d_test 6390 4256 81 81 1
 3. 使用未修改的 `conv/bench_conv.c` 验证正确性。
 4. 在相同编译器、线程数和 NUMA 绑定下重复测试并比较性能。
 5. 检查 `conv/` 与 `conv_init/` 的差异，确认测试程序和赛题说明未被改动。
-6. 在 `conv/` 中准备并验证一键编译和测试的 `run.sh`，再制作提交包。
-
+6. 使用 `conv/run.sh` 完成一键编译和测试验证，再制作提交包。
