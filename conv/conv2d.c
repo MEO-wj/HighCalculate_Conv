@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <omp.h>
 
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SME)
+#include <linux/prctl.h>
+#include <sys/prctl.h>
+#endif
+
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #endif
@@ -53,8 +58,137 @@ typedef int CONVINT;
 #define CONV_SME_ALIGNED_PACKING 1
 #endif
 
+/*
+ * Compile-time tuning knobs.  They describe generic kernel-width classes and
+ * cache layout rather than any complete public benchmark shape, so candidate
+ * values can be searched without specializing on rows/columns combinations.
+ */
+#ifndef CONV_SME_TASKS_SMALL
+#define CONV_SME_TASKS_SMALL 4
+#endif
+
+#ifndef CONV_SME_TASKS_LARGE
+#define CONV_SME_TASKS_LARGE 5
+#endif
+
+#ifndef CONV_SME_TASK_SPLIT_WIDTH
+#define CONV_SME_TASK_SPLIT_WIDTH 64
+#endif
+
+#ifndef CONV_SME_PREFETCH_MIN_WIDTH
+#define CONV_SME_PREFETCH_MIN_WIDTH 41
+#endif
+
+#ifndef CONV_SME_PREFETCH_MAX_WIDTH
+#define CONV_SME_PREFETCH_MAX_WIDTH 64
+#endif
+
+#ifndef CONV_SME_PREFETCH_ROWS_MEDIUM
+#define CONV_SME_PREFETCH_ROWS_MEDIUM 2
+#endif
+
+#ifndef CONV_SME_PREFETCH_ROWS_SMALL
+#define CONV_SME_PREFETCH_ROWS_SMALL 1
+#endif
+
+#ifndef CONV_SME_PREFETCH_ROWS_LARGE
+#define CONV_SME_PREFETCH_ROWS_LARGE 1
+#endif
+
+#ifndef CONV_SME_INPUT_PREFETCH_DISTANCE
+#define CONV_SME_INPUT_PREFETCH_DISTANCE 4
+#endif
+
+#ifndef CONV_SME_TAIL_UNROLL
+#define CONV_SME_TAIL_UNROLL 1
+#endif
+
+/*
+ * Reuse the five live input windows for small/medium kernel tails.  This keeps
+ * the original accumulation order but replaces four overlapping vector loads
+ * per tail column with four register EXT operations and one predicated lane
+ * refill.  Wider kernels retain the direct-load tail, which is more robust
+ * under their higher cache and register pressure.
+ */
+#ifndef CONV_SME_CARRY_TAIL
+#define CONV_SME_CARRY_TAIL 1
+#endif
+
+#ifndef CONV_SME_CARRY_TAIL_MAX_WIDTH
+#define CONV_SME_CARRY_TAIL_MAX_WIDTH 64
+#endif
+
+#ifndef CONV_SME_GUIDED_MIN_TASKS_PER_THREAD
+#define CONV_SME_GUIDED_MIN_TASKS_PER_THREAD 16
+#endif
+
+#ifndef CONV_SME_BLOCKS_PER_TASK
+#define CONV_SME_BLOCKS_PER_TASK 1
+#endif
+
+/*
+ * Fine static tasks remove the coarse column-partition tail on sufficiently
+ * large problems.  Small problems retain the lower-overhead partition path;
+ * wide kernels retain the separately validated guided schedule.
+ */
+#ifndef CONV_SME_FINE_TASK_MIN_PER_THREAD
+#define CONV_SME_FINE_TASK_MIN_PER_THREAD 16
+#endif
+
+#if CONV_SME_BLOCKS_PER_TASK < 0
+#error "CONV_SME_BLOCKS_PER_TASK must be non-negative"
+#endif
+
+#if CONV_SME_FINE_TASK_MIN_PER_THREAD < 1
+#error "CONV_SME_FINE_TASK_MIN_PER_THREAD must be positive"
+#endif
+
+#if CONV_SME_TASKS_SMALL < 1 || CONV_SME_TASKS_LARGE < 1
+#error "CONV SME task counts must be positive"
+#endif
+
+#if CONV_SME_GUIDED_MIN_TASKS_PER_THREAD < 1
+#error "CONV SME guided scheduling threshold must be positive"
+#endif
+
+#if CONV_SME_PREFETCH_ROWS_SMALL < 0 || CONV_SME_PREFETCH_ROWS_MEDIUM < 0 || \
+    CONV_SME_PREFETCH_ROWS_LARGE < 0
+#error "CONV SME prefetch row counts must be non-negative"
+#endif
+
+#if CONV_SME_TAIL_UNROLL != 1 && CONV_SME_TAIL_UNROLL != 2 && \
+    CONV_SME_TAIL_UNROLL != 4 && CONV_SME_TAIL_UNROLL != 8
+#error "CONV_SME_TAIL_UNROLL must be 1, 2, 4, or 8"
+#endif
+
 #if CONV_SME_CARRY_WINDOWS && !CONV_SME_ITERATIVE_WINDOWS
 #error "CONV_SME_CARRY_WINDOWS requires CONV_SME_ITERATIVE_WINDOWS"
+#endif
+
+#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SME) && \
+    defined(PR_SME_SET_VL) && defined(PR_SME_GET_VL) &&                  \
+    defined(PR_SME_VL_INHERIT) && defined(PR_SME_VL_LEN_MASK)
+static int conv_sme_vl_64_ready;
+
+/*
+ * The fixed-width SME kernel uses sixteen FP32 lanes.  Configure the process
+ * before main creates the OpenMP pool so every worker inherits the required
+ * 64-byte streaming vector length.  This changes only the process ABI state,
+ * not the machine-wide SME sysctl.
+ */
+__attribute__((constructor)) static void conv_configure_sme_vl(void)
+{
+    const unsigned long requested = 64UL | PR_SME_VL_INHERIT;
+    if (prctl(PR_SME_SET_VL, requested, 0UL, 0UL, 0UL) < 0) {
+        return;
+    }
+
+    const int actual = prctl(PR_SME_GET_VL, 0UL, 0UL, 0UL, 0UL);
+    conv_sme_vl_64_ready =
+        actual >= 0 && (actual & PR_SME_VL_LEN_MASK) == 64;
+}
+#else
+static const int conv_sme_vl_64_ready = 0;
 #endif
 
 #if defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SVE_BITS) && \
@@ -64,25 +198,38 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                   const CONVFLOAT* __restrict__ packedKernel,
                   CONVINT kernelHeight, CONVINT kernelWidth,
                   CONVFLOAT* __restrict__ output, CONVINT outputHeight,
-                  CONVINT outputWidth, CONVINT threadId, CONVINT threadCount)
+                  CONVINT outputWidth, int useFineTasks)
 {
     const uint32_t tileSize = 16;
+    const size_t packedColumnStride = tileSize;
     /*
-     * Medium kernels benefit from finer column partitions.  Wider kernels
-     * already provide enough work per row tile, so two partitions retain
-     * more sequential cache locality without compromising load balance.
+     * Medium kernels use fine 64-column tasks.  Wider kernels keep several
+     * adjacent column blocks in each task; five partitions reduced the long
+     * per-thread tail while retaining sequential input/cache reuse.
      */
-    const CONVINT tasksPerRowTile = kernelWidth > 64 ? 2 : 4;
+    const CONVINT partitionTasksPerRowTile =
+        kernelWidth > CONV_SME_TASK_SPLIT_WIDTH
+            ? CONV_SME_TASKS_LARGE
+            : CONV_SME_TASKS_SMALL;
     const CONVINT totalRowTiles = (outputHeight + (CONVINT)tileSize - 1) /
                                   (CONVINT)tileSize;
     const CONVINT fullColBlocks = outputWidth / (4 * (CONVINT)tileSize);
+#if CONV_SME_BLOCKS_PER_TASK > 0
+    const CONVINT hasColTail =
+        fullColBlocks * 4 * (CONVINT)tileSize < outputWidth;
+    const CONVINT fullColTasks =
+        (fullColBlocks + CONV_SME_BLOCKS_PER_TASK - 1) /
+        CONV_SME_BLOCKS_PER_TASK;
+    const CONVINT fineTasksPerRowTile =
+        fullColTasks + hasColTail > 0 ? fullColTasks + hasColTail : 1;
+    const CONVINT tasksPerRowTile =
+        useFineTasks ? fineTasksPerRowTile : partitionTasksPerRowTile;
+#else
+    const CONVINT tasksPerRowTile = partitionTasksPerRowTile;
+#endif
     const CONVINT totalTasks = totalRowTiles * tasksPerRowTile;
-    const CONVINT firstTask =
-        (CONVINT)(((int64_t)totalTasks * threadId) / threadCount);
-    const CONVINT lastTask =
-        (CONVINT)(((int64_t)totalTasks * (threadId + 1)) / threadCount);
-
-    for (CONVINT task = firstTask; task < lastTask; ++task) {
+#pragma omp for schedule(runtime)
+    for (CONVINT task = 0; task < totalTasks; ++task) {
         const CONVINT rowTileIndex = task / tasksPerRowTile;
         const CONVINT colPartition = task % tasksPerRowTile;
         const CONVINT outputRowStart = rowTileIndex * (CONVINT)tileSize;
@@ -92,17 +239,41 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 : (CONVINT)tileSize;
         const svbool_t activeRows = svwhilelt_b32((uint64_t)0, (uint64_t)rowCount);
         const CONVINT prefetchRowsPerStep =
-            (kernelWidth >= 41 && kernelWidth <= 64) ? 2 : 1;
+            kernelWidth < CONV_SME_PREFETCH_MIN_WIDTH
+                ? CONV_SME_PREFETCH_ROWS_SMALL
+                : (kernelWidth <= CONV_SME_PREFETCH_MAX_WIDTH
+                       ? CONV_SME_PREFETCH_ROWS_MEDIUM
+                       : CONV_SME_PREFETCH_ROWS_LARGE);
         const CONVINT prefetchSteps =
-            (rowCount + prefetchRowsPerStep - 1) / prefetchRowsPerStep;
+            prefetchRowsPerStep > 0
+                ? (rowCount + prefetchRowsPerStep - 1) / prefetchRowsPerStep
+                : 0;
         const CONVINT prefetchStart =
             kernelHeight + rowCount - 1 - prefetchSteps;
 
+#if CONV_SME_BLOCKS_PER_TASK > 0
+        const CONVINT firstColBlock = useFineTasks
+            ? (colPartition < fullColTasks
+                   ? colPartition * CONV_SME_BLOCKS_PER_TASK
+                   : fullColBlocks)
+            : (CONVINT)(((int64_t)fullColBlocks * colPartition) /
+                        tasksPerRowTile);
+        const CONVINT fineLastColBlock =
+            firstColBlock < fullColBlocks &&
+                    firstColBlock + CONV_SME_BLOCKS_PER_TASK < fullColBlocks
+                ? firstColBlock + CONV_SME_BLOCKS_PER_TASK
+                : fullColBlocks;
+        const CONVINT lastColBlock = useFineTasks
+            ? fineLastColBlock
+            : (CONVINT)(((int64_t)fullColBlocks * (colPartition + 1)) /
+                        tasksPerRowTile);
+#else
         const CONVINT firstColBlock =
             (CONVINT)(((int64_t)fullColBlocks * colPartition) / tasksPerRowTile);
         const CONVINT lastColBlock =
             (CONVINT)(((int64_t)fullColBlocks * (colPartition + 1)) /
                       tasksPerRowTile);
+#endif
         const CONVINT fullColEnd = lastColBlock * 4 * (CONVINT)tileSize;
         CONVINT outputColStart = firstColBlock * 4 * (CONVINT)tileSize;
         for (; outputColStart < fullColEnd;
@@ -117,6 +288,26 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                     outputColStart;
                 const CONVFLOAT* const packedRow =
                     packedKernel + (size_t)physicalRow * kernelWidth * tileSize;
+#if CONV_SME_INPUT_PREFETCH_DISTANCE > 0
+                if (kernelWidth >= CONV_SME_PREFETCH_MIN_WIDTH &&
+                    kernelWidth <= CONV_SME_PREFETCH_MAX_WIDTH &&
+                    physicalRow + CONV_SME_INPUT_PREFETCH_DISTANCE <
+                    kernelHeight + rowCount - 1) {
+                    const CONVFLOAT* const inputPrefetch =
+                        input +
+                        (size_t)(outputRowStart + physicalRow +
+                                 CONV_SME_INPUT_PREFETCH_DISTANCE) *
+                            inputWidth +
+                        outputColStart;
+                    __builtin_prefetch(inputPrefetch, 0, 2);
+                    __builtin_prefetch(inputPrefetch + 32, 0, 2);
+                    __builtin_prefetch(inputPrefetch + 64, 0, 2);
+                    __builtin_prefetch(inputPrefetch + 96, 0, 2);
+                    if (kernelWidth > 65) {
+                        __builtin_prefetch(inputPrefetch + 128, 0, 2);
+                    }
+                }
+#endif
                 const CONVINT prefetchStep = physicalRow - prefetchStart;
                 if (prefetchStep >= 0 && prefetchStep < prefetchSteps) {
                     for (CONVINT prefetchOffset = 0;
@@ -151,7 +342,12 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                     const CONVFLOAT* const inputBase = inputRow + ik;
 #if CONV_SME_ITERATIVE_WINDOWS && CONV_SME_CARRY_WINDOWS
                     const svbool_t finalInputLanes =
-                        ik + 31 < kernelWidth ? allCols : extensionLanes;
+                        ik + 31 < kernelWidth ||
+                                (CONV_SME_CARRY_TAIL &&
+                                 kernelWidth <= CONV_SME_CARRY_TAIL_MAX_WIDTH &&
+                                 ik + 16 < kernelWidth)
+                            ? allCols
+                            : extensionLanes;
                     if (ik == 0) {
                         window0 = svld1_f32(allCols, inputBase);
                         window1 = svld1_f32(allCols, inputBase + tileSize);
@@ -185,7 +381,8 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 #endif
 
                     const svfloat32_t kernelValues0 =
-                        svld1_f32(activeRows, packedRow + (size_t)ik * tileSize);
+                        svld1_f32(activeRows,
+                                  packedRow + (size_t)ik * packedColumnStride);
                     svmopa_za32_f32_m(0, activeRows, allCols, kernelValues0,
                                       inputValues0);
                     svmopa_za32_f32_m(1, activeRows, allCols, kernelValues0,
@@ -207,14 +404,15 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 
 #define CONV_SME_SLIDE_STEP(SHIFT)                                              \
                     do {                                                        \
+                        const svfloat32_t kernelValues = svld1_f32(             \
+                            activeRows, packedRow +                            \
+                                            (size_t)(ik + (SHIFT)) *           \
+                                                packedColumnStride);           \
                         window0 = svext_f32(window0, window1, 1);               \
                         window1 = svext_f32(window1, window2, 1);               \
                         window2 = svext_f32(window2, window3, 1);               \
                         window3 = svext_f32(window3, window4, 1);               \
                         window4 = svext_f32(window4, zeroWindow, 1);            \
-                        const svfloat32_t kernelValues = svld1_f32(             \
-                            activeRows, packedRow + (size_t)(ik + (SHIFT)) *   \
-                                                      tileSize);                \
                         svmopa_za32_f32_m(0, activeRows, allCols, kernelValues, \
                                           window0);                             \
                         svmopa_za32_f32_m(1, activeRows, allCols, kernelValues, \
@@ -228,13 +426,14 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 #if !CONV_SME_CARRY_WINDOWS
 #define CONV_SME_SLIDE_FINAL(SHIFT)                                             \
                     do {                                                        \
+                        const svfloat32_t kernelValues = svld1_f32(             \
+                            activeRows, packedRow +                            \
+                                            (size_t)(ik + (SHIFT)) *           \
+                                                packedColumnStride);           \
                         window0 = svext_f32(window0, window1, 1);               \
                         window1 = svext_f32(window1, window2, 1);               \
                         window2 = svext_f32(window2, window3, 1);               \
                         window3 = svext_f32(window3, window4, 1);               \
-                        const svfloat32_t kernelValues = svld1_f32(             \
-                            activeRows, packedRow + (size_t)(ik + (SHIFT)) *   \
-                                                      tileSize);                \
                         svmopa_za32_f32_m(0, activeRows, allCols, kernelValues, \
                                           window0);                             \
                         svmopa_za32_f32_m(1, activeRows, allCols, kernelValues, \
@@ -249,8 +448,9 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 #define CONV_SME_SLIDE_STEP(SHIFT)                                                 \
                     do {                                                           \
                         const svfloat32_t kernelValues = svld1_f32(                 \
-                            activeRows, packedRow + (size_t)(ik + (SHIFT)) *       \
-                                                      tileSize);                    \
+                            activeRows, packedRow +                                \
+                                            (size_t)(ik + (SHIFT)) *               \
+                                                packedColumnStride);               \
                         svmopa_za32_f32_m(                                          \
                             0, activeRows, allCols, kernelValues,                  \
                             svext_f32(inputValues0, inputValues1, (SHIFT)));         \
@@ -291,9 +491,45 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 #endif
                 }
 
+#if CONV_SME_CARRY_TAIL && CONV_SME_ITERATIVE_WINDOWS && \
+    CONV_SME_CARRY_WINDOWS
+                if (ik > 0 && ik < kernelWidth &&
+                    kernelWidth <= CONV_SME_CARRY_TAIL_MAX_WIDTH) {
+                    const svbool_t oneInputLane =
+                        svwhilelt_b32((uint64_t)0, (uint64_t)1);
+                    for (; ik < kernelWidth; ++ik) {
+                        const svfloat32_t kernelValues =
+                            svld1_f32(activeRows,
+                                      packedRow +
+                                          (size_t)ik * packedColumnStride);
+                        window0 = svext_f32(window0, window1, 1);
+                        window1 = svext_f32(window1, window2, 1);
+                        window2 = svext_f32(window2, window3, 1);
+                        window3 = svext_f32(window3, window4, 1);
+                        svmopa_za32_f32_m(0, activeRows, allCols, kernelValues,
+                                          window0);
+                        svmopa_za32_f32_m(1, activeRows, allCols, kernelValues,
+                                          window1);
+                        svmopa_za32_f32_m(2, activeRows, allCols, kernelValues,
+                                          window2);
+                        svmopa_za32_f32_m(3, activeRows, allCols, kernelValues,
+                                          window3);
+                        if (ik + 1 < kernelWidth) {
+                            window4 = svld1_f32(
+                                oneInputLane,
+                                inputRow + ik + 4 * (CONVINT)tileSize);
+                        }
+                    }
+                }
+#endif
+
+#if CONV_SME_TAIL_UNROLL > 1
+#pragma clang loop unroll_count(CONV_SME_TAIL_UNROLL)
+#endif
                 for (; ik < kernelWidth; ++ik) {
                     const svfloat32_t kernelValues =
-                        svld1_f32(activeRows, packedRow + (size_t)ik * tileSize);
+                        svld1_f32(activeRows,
+                                  packedRow + (size_t)ik * packedColumnStride);
                     const CONVFLOAT* const inputBase = inputRow + ik;
                     const svfloat32_t inputValues0 =
                         svld1_f32(allCols, inputBase);
@@ -352,7 +588,8 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 
                 for (CONVINT ik = 0; ik < kernelWidth; ++ik) {
                     const svfloat32_t kernelValues =
-                        svld1_f32(activeRows, packedRow + (size_t)ik * tileSize);
+                        svld1_f32(activeRows,
+                                  packedRow + (size_t)ik * packedColumnStride);
                     const svfloat32_t inputValues =
                         svld1_f32(activeCols, inputRow + ik);
                     svmopa_za32_f32_m(0, activeRows, activeCols, kernelValues,
@@ -368,6 +605,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
         }
     }
 }
+
 #endif
 
 void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT inputWidth,
@@ -379,6 +617,7 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
 
 #if defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SVE_BITS) && \
     __ARM_FEATURE_SVE_BITS == 512 && CONV_USE_SME
+    if (conv_sme_vl_64_ready) {
     const size_t tileSize = 16;
     const size_t packedPhysicalRows = (size_t)kernelHeight + tileSize - 1;
     size_t packedGroups = 0;
@@ -388,10 +627,13 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
         packedGroups = packedPhysicalRows * (size_t)kernelWidth;
     }
 
-    if (packedGroups > 0 && packedGroups <= SIZE_MAX / tileSize &&
-        packedGroups * tileSize <= SIZE_MAX / sizeof(CONVFLOAT)) {
+    const size_t packedGroupElements = tileSize;
+    if (packedGroups > 0 &&
+        packedGroups <= SIZE_MAX / packedGroupElements &&
+        packedGroups * packedGroupElements <= SIZE_MAX / sizeof(CONVFLOAT)) {
+        const size_t packedElements = packedGroups * packedGroupElements;
         const size_t packedBytes =
-            packedGroups * tileSize * sizeof(CONVFLOAT);
+            packedElements * sizeof(CONVFLOAT);
 #if CONV_SME_ALIGNED_PACKING
         /* One packed 16-lane FP32 vector is exactly one 64-byte cache line. */
         CONVFLOAT* const packedKernel =
@@ -401,6 +643,51 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
             (CONVFLOAT*)malloc(packedBytes);
 #endif
         if (packedKernel != NULL) {
+            const CONVINT scheduleRowTiles =
+                (outputHeight + (CONVINT)tileSize - 1) / (CONVINT)tileSize;
+            const CONVINT partitionScheduleTasksPerRowTile =
+                kernelWidth > CONV_SME_TASK_SPLIT_WIDTH
+                    ? CONV_SME_TASKS_LARGE
+                    : CONV_SME_TASKS_SMALL;
+#if CONV_SME_BLOCKS_PER_TASK > 0
+            const CONVINT scheduleFullColBlocks =
+                outputWidth / (4 * (CONVINT)tileSize);
+            const CONVINT fineScheduleTasksPerRowTile =
+                (scheduleFullColBlocks + CONV_SME_BLOCKS_PER_TASK - 1) /
+                    CONV_SME_BLOCKS_PER_TASK +
+                ((outputWidth % (4 * (CONVINT)tileSize)) != 0);
+#else
+            const CONVINT fineScheduleTasksPerRowTile = 0;
+#endif
+            const int scheduleThreads = omp_get_max_threads();
+            const int useFineTasks =
+                kernelWidth <= CONV_SME_TASK_SPLIT_WIDTH &&
+                fineScheduleTasksPerRowTile > 0 && scheduleThreads > 0 &&
+                (int64_t)scheduleRowTiles * fineScheduleTasksPerRowTile >=
+                    (int64_t)scheduleThreads *
+                        CONV_SME_FINE_TASK_MIN_PER_THREAD;
+            const CONVINT scheduleTasksPerRowTile =
+                useFineTasks ? fineScheduleTasksPerRowTile
+                             : partitionScheduleTasksPerRowTile;
+            const int64_t scheduleTasks =
+                (int64_t)scheduleRowTiles * scheduleTasksPerRowTile;
+            /*
+             * Medium kernels use equal-weight static 64-column tasks when the
+             * problem is large enough.  Wide kernels keep coarse tasks and use
+             * guided scheduling to avoid runtime dispatch on every block.
+             */
+            const int useGuidedSchedule =
+                !useFineTasks && kernelWidth > CONV_SME_TASK_SPLIT_WIDTH &&
+                scheduleThreads > 0 &&
+                scheduleTasks >=
+                    (int64_t)scheduleThreads *
+                        CONV_SME_GUIDED_MIN_TASKS_PER_THREAD;
+            omp_sched_t previousSchedule;
+            int previousChunkSize;
+            omp_get_schedule(&previousSchedule, &previousChunkSize);
+            omp_set_schedule(useGuidedSchedule ? omp_sched_guided
+                                               : omp_sched_static,
+                             useGuidedSchedule ? 1 : 0);
 #pragma omp parallel
             {
 #pragma omp for schedule(static)
@@ -421,11 +708,13 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
 
                 conv2d_sme_worker(input, inputWidth, packedKernel, kernelHeight,
                                   kernelWidth, output, outputHeight, outputWidth,
-                                  omp_get_thread_num(), omp_get_num_threads());
+                                  useFineTasks);
             }
+            omp_set_schedule(previousSchedule, previousChunkSize);
             free(packedKernel);
             return;
         }
+    }
     }
 #endif
 
@@ -935,3 +1224,8 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
 #undef CONV_SME_ITERATIVE_WINDOWS
 #undef CONV_SME_CARRY_WINDOWS
 #undef CONV_SME_ALIGNED_PACKING
+#undef CONV_SME_BLOCKS_PER_TASK
+#undef CONV_SME_FINE_TASK_MIN_PER_THREAD
+#undef CONV_SME_INPUT_PREFETCH_DISTANCE
+#undef CONV_SME_CARRY_TAIL
+#undef CONV_SME_CARRY_TAIL_MAX_WIDTH
