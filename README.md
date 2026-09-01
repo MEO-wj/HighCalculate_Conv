@@ -12,8 +12,10 @@ Conv/
 ├── AGENTS.md              # 赛事约束及开发、验证、提交规范
 ├── README.md              # 仓库总览（本文件）
 ├── docs/
-│   ├── optimization-report.md  # 2026-08-27 12:00–18:00 全阶段报告
-│   └── 2026-08-27-Conv高性能计算优化流程和结论.md  # 同时段 SME 分析与实验复盘
+│   ├── optimization-report.md  # 完整实验记录与性能分析
+│   ├── 2026-08-27-Conv高性能计算优化流程和结论.md  # 提交前精简总结
+│   ├── 2026-08-27-Conv高性能计算优化流程和结论.pdf  # 提交前精简 PDF 版本
+│   └── 2026-08-28-Conv下一阶段高性能优化开发计划.md  # 后续优化路线
 ├── conv_init/             # 官方初版备份，只读，不进行优化修改
 │   ├── README.md          # 原始 CONV 赛题说明
 │   ├── bench_conv.c       # 原始测试与性能评测程序
@@ -85,7 +87,7 @@ cd conv
 bash run.sh
 ```
 
-`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对 `conv2d.c` 启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；GCC 模式保留显式 SVE 回退。默认绑定 NUMA 7，编译器和节点均可显式切换：
+`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对 `conv2d.c` 启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；中等 kernel 的大任务采用等重 64 列 static 任务，宽 kernel 保留 coarse + guided 调度，小任务自动回退低开销分区。GCC 模式保留显式 SVE 回退。默认绑定 NUMA 7，编译器和节点均可显式切换：
 
 ```sh
 COMPILER=bisheng NUMA_NODE=7 bash run.sh
