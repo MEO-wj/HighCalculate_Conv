@@ -193,6 +193,19 @@ static const int conv_sme_vl_64_ready = 0;
 
 #if defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SVE_BITS) && \
     __ARM_FEATURE_SVE_BITS == 512 && CONV_USE_SME
+/*
+ * SME 主计算内核。
+ *
+ * 一个任务块最多计算 16 个输出行和 64 个输出列：
+ *   - ZA 的 16 行对应 16 个相邻输出行；
+ *   - ZA0、ZA1、ZA2、ZA3 分别对应四组 16 列输出；
+ *   - packedKernel 提供 16 个输出行所需的 kernel 系数向量；
+ *   - input 向量提供 16 个相邻输出列的数据；
+ *   - FMOPA 将两者做外积并直接累加到 ZA。
+ *
+ * 函数在外层 OpenMP parallel 区域中由所有线程共同调用，内部 omp for
+ * 只负责分配互不重叠的输出块，因此不需要锁或原子操作。
+ */
 __arm_new("za") __arm_locally_streaming static void
 conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                   const CONVFLOAT* __restrict__ packedKernel,
@@ -203,9 +216,9 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
     const uint32_t tileSize = 16;
     const size_t packedColumnStride = tileSize;
     /*
-     * Medium kernels use fine 64-column tasks.  Wider kernels keep several
-     * adjacent column blocks in each task; five partitions reduced the long
-     * per-thread tail while retaining sequential input/cache reuse.
+     * 中小 kernel 在任务总数足够时使用细粒度 64 列任务；宽 kernel 将相邻
+     * 列块保留在同一任务内。前者减少线程收尾差，后者保留顺序访存和缓存
+     * 局部性。这里只按通用 kernel 宽度和任务量分类，不识别公开 Case。
      */
     const CONVINT partitionTasksPerRowTile =
         kernelWidth > CONV_SME_TASK_SPLIT_WIDTH
@@ -228,6 +241,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
     const CONVINT tasksPerRowTile = partitionTasksPerRowTile;
 #endif
     const CONVINT totalTasks = totalRowTiles * tasksPerRowTile;
+    /* schedule(runtime) 由 conv2d 根据工作量统一设为 static 或 guided。 */
 #pragma omp for schedule(runtime)
     for (CONVINT task = 0; task < totalTasks; ++task) {
         const CONVINT rowTileIndex = task / tasksPerRowTile;
@@ -251,6 +265,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
         const CONVINT prefetchStart =
             kernelHeight + rowCount - 1 - prefetchSteps;
 
+        /*
+         * 将当前 row tile 的完整 64 列块映射到本任务。
+         * fine 模式通常每任务处理一个 64 列块；coarse 模式处理一个连续区间。
+         */
 #if CONV_SME_BLOCKS_PER_TASK > 0
         const CONVINT firstColBlock = useFineTasks
             ? (colPartition < fullColTasks
@@ -279,8 +297,14 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
         for (; outputColStart < fullColEnd;
              outputColStart += 4 * (CONVINT)tileSize) {
             const svbool_t allCols = svptrue_b32();
+            /* 每个 16×64 输出块从零开始，在 ZA 中完成全部累加后只写回一次。 */
             svzero_za();
 
+            /*
+             * 同时计算 rowCount 个相邻输出行会覆盖 KH+rowCount-1 个物理输入行。
+             * packedRow 已将该物理行对应的 16 个 kernel 系数排成一个向量，
+             * 无效的顶部/底部 lane 为 0，因此热循环中不需要逐 lane 分支。
+             */
             for (CONVINT physicalRow = 0;
                  physicalRow < kernelHeight + rowCount - 1; ++physicalRow) {
                 const CONVFLOAT* const inputRow =
@@ -289,6 +313,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 const CONVFLOAT* const packedRow =
                     packedKernel + (size_t)physicalRow * kernelWidth * tileSize;
 #if CONV_SME_INPUT_PREFETCH_DISTANCE > 0
+                /* 只对已实测受益的中等 kernel 宽度预取后续 input 行。 */
                 if (kernelWidth >= CONV_SME_PREFETCH_MIN_WIDTH &&
                     kernelWidth <= CONV_SME_PREFETCH_MAX_WIDTH &&
                     physicalRow + CONV_SME_INPUT_PREFETCH_DISTANCE <
@@ -309,6 +334,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 }
 #endif
                 const CONVINT prefetchStep = physicalRow - prefetchStart;
+                /*
+                 * 在计算接近结束时逐步取得输出缓存行的写所有权，避免 16×64
+                 * 结果同时写回时集中承担 write-allocate 延迟。
+                 */
                 if (prefetchStep >= 0 && prefetchStep < prefetchSteps) {
                     for (CONVINT prefetchOffset = 0;
                          prefetchOffset < prefetchRowsPerStep; ++prefetchOffset) {
@@ -331,6 +360,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 const svbool_t extensionLanes =
                     svwhilelt_b32((uint64_t)0, (uint64_t)15);
 #if CONV_SME_ITERATIVE_WINDOWS && CONV_SME_CARRY_WINDOWS
+                /*
+                 * 五个连续 SVE 向量覆盖四组 16 列输出及右侧扩展数据。
+                 * 完整 16 列 kernel 组之间继续携带窗口，减少重复 input 加载。
+                 */
                 const svfloat32_t zeroWindow = svdup_f32(0.0f);
                 svfloat32_t window0 = zeroWindow;
                 svfloat32_t window1 = zeroWindow;
@@ -383,6 +416,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                     const svfloat32_t kernelValues0 =
                         svld1_f32(activeRows,
                                   packedRow + (size_t)ik * packedColumnStride);
+                    /*
+                     * 同一个 kernel 系数向量复用四次，分别更新 ZA0-ZA3；
+                     * 一轮对应 16 个输出行 × 64 个输出列。
+                     */
                     svmopa_za32_f32_m(0, activeRows, allCols, kernelValues0,
                                       inputValues0);
                     svmopa_za32_f32_m(1, activeRows, allCols, kernelValues0,
@@ -402,6 +439,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                     const svfloat32_t zeroWindow = svdup_f32(0.0f);
 #endif
 
+                    /*
+                     * kernel 向右移动一列时，四个 input 窗口也右移一 lane。
+                     * EXT 复用相邻向量重叠数据，避免重新执行四个完整 LD1W。
+                     */
 #define CONV_SME_SLIDE_STEP(SHIFT)                                              \
                     do {                                                        \
                         const svfloat32_t kernelValues = svld1_f32(             \
@@ -493,6 +534,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 
 #if CONV_SME_CARRY_TAIL && CONV_SME_ITERATIVE_WINDOWS && \
     CONV_SME_CARRY_WINDOWS
+                /*
+                 * 中小 kernel 的不足 16 列尾部继续使用已有窗口；每步只加载
+                 * 最右侧新进入的一个 lane。宽 kernel 经实测采用下方直接加载更稳。
+                 */
                 if (ik > 0 && ik < kernelWidth &&
                     kernelWidth <= CONV_SME_CARRY_TAIL_MAX_WIDTH) {
                     const svbool_t oneInputLane =
@@ -526,6 +571,10 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
 #if CONV_SME_TAIL_UNROLL > 1
 #pragma clang loop unroll_count(CONV_SME_TAIL_UNROLL)
 #endif
+                /*
+                 * 通用 kernel 列尾：直接加载四个 input 向量并继续 FMOPA。
+                 * 该路径也覆盖未启用 carry-tail 的宽 kernel，保持任意合法宽度正确。
+                 */
                 for (; ik < kernelWidth; ++ik) {
                     const svfloat32_t kernelValues =
                         svld1_f32(activeRows,
@@ -550,6 +599,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 }
             }
 
+            /* ZA 中已经是最终结果；逐行写回四个 16 列 tile，不保存中间部分和。 */
             for (CONVINT row = 0; row < rowCount; ++row) {
                 CONVFLOAT* const outputBase =
                     output + (size_t)(outputRowStart + row) * outputWidth +
@@ -564,6 +614,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
             }
         }
 
+        /* 输出宽度不足 64 列的最终部分只交给该 row tile 的最后一个任务。 */
         if (colPartition != tasksPerRowTile - 1) {
             continue;
         }
@@ -576,6 +627,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                     : (CONVINT)tileSize;
             const svbool_t activeCols =
                 svwhilelt_b32((uint64_t)0, (uint64_t)colCount);
+            /* 列尾改用谓词化单 ZA 16×16 内核，禁止越界读写。 */
             svzero_za();
 
             for (CONVINT physicalRow = 0;
@@ -612,13 +664,19 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
             const CONVFLOAT* __restrict__ kernel, CONVINT kernelHeight, CONVINT kernelWidth,
             CONVFLOAT* __restrict__ output)
 {
+    /* valid convolution：不填充，输出尺寸由输入尺寸减去 kernel 尺寸得到。 */
     const CONVINT outputHeight = inputHeight - kernelHeight + 1;
     const CONVINT outputWidth = inputWidth - kernelWidth + 1;
 
 #if defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SVE_BITS) && \
     __ARM_FEATURE_SVE_BITS == 512 && CONV_USE_SME
+    /* 只有成功配置 512 位 streaming vector length 时才进入固定 16-lane SME 路径。 */
     if (conv_sme_vl_64_ready) {
     const size_t tileSize = 16;
+    /*
+     * 16 个相邻输出行共同需要 KH+15 个物理输入行。打包时为每个
+     * (physicalRow, kernelColumn) 保存一个 16-lane kernel 系数向量。
+     */
     const size_t packedPhysicalRows = (size_t)kernelHeight + tileSize - 1;
     size_t packedGroups = 0;
 
@@ -635,7 +693,7 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
         const size_t packedBytes =
             packedElements * sizeof(CONVFLOAT);
 #if CONV_SME_ALIGNED_PACKING
-        /* One packed 16-lane FP32 vector is exactly one 64-byte cache line. */
+        /* 一个 packed 16-lane FP32 向量恰好为 64 字节，与缓存行对齐。 */
         CONVFLOAT* const packedKernel =
             (CONVFLOAT*)aligned_alloc(64, packedBytes);
 #else
@@ -643,6 +701,11 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
             (CONVFLOAT*)malloc(packedBytes);
 #endif
         if (packedKernel != NULL) {
+            /*
+             * 调度选择只依赖 kernel 宽度、输出 tile 数和线程数：
+             * 任务足够多的中小 kernel 使用 fine-static；宽 kernel 使用
+             * coarse-guided；小问题回退 coarse-static，避免调度开销。
+             */
             const CONVINT scheduleRowTiles =
                 (outputHeight + (CONVINT)tileSize - 1) / (CONVINT)tileSize;
             const CONVINT partitionScheduleTasksPerRowTile =
@@ -671,11 +734,7 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
                              : partitionScheduleTasksPerRowTile;
             const int64_t scheduleTasks =
                 (int64_t)scheduleRowTiles * scheduleTasksPerRowTile;
-            /*
-             * Medium kernels use equal-weight static 64-column tasks when the
-             * problem is large enough.  Wide kernels keep coarse tasks and use
-             * guided scheduling to avoid runtime dispatch on every block.
-             */
+            /* 宽 kernel 任务更重，guided(1) 用于减少最后少数线程的长尾。 */
             const int useGuidedSchedule =
                 !useFineTasks && kernelWidth > CONV_SME_TASK_SPLIT_WIDTH &&
                 scheduleThreads > 0 &&
@@ -690,6 +749,10 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
                              useGuidedSchedule ? 1 : 0);
 #pragma omp parallel
             {
+                /*
+                 * 多线程并行打包 kernel。jk = physicalRow-outputRow 保持每个
+                 * 输出元素原有的 jk -> ik 累加顺序；边界外系数填 0。
+                 */
 #pragma omp for schedule(static)
                 for (size_t group = 0; group < packedGroups; ++group) {
                     const CONVINT physicalRow =
@@ -710,6 +773,7 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
                                   kernelWidth, output, outputHeight, outputWidth,
                                   useFineTasks);
             }
+            /* 恢复调用者原有 OpenMP runtime 调度状态，避免污染外部程序。 */
             omp_set_schedule(previousSchedule, previousChunkSize);
             free(packedKernel);
             return;
