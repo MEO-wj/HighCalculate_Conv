@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <omp.h>
 
 #if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SME)
@@ -54,8 +55,47 @@ typedef int CONVINT;
 #define CONV_SME_CARRY_WINDOWS 1
 #endif
 
+#ifndef CONV_SME_ASM_DOUBLE_BUFFER
+#define CONV_SME_ASM_DOUBLE_BUFFER 0
+#endif
+
+
+
+/* Experimental 16x128 SME mapping; kept off for the normal submission path. */
+#ifndef CONV_SME_WIDE128_EXPERIMENT
+#define CONV_SME_WIDE128_EXPERIMENT 0
+#endif
+
 #ifndef CONV_SME_ALIGNED_PACKING
 #define CONV_SME_ALIGNED_PACKING 1
+#endif
+
+/*
+ * Reuse only the packed representation of unchanged convolution weights.
+ * The cache is bounded to one entry per calling thread and validates the full
+ * kernel contents, so changing data at the same address still rebuilds it.
+ */
+#ifndef CONV_SME_CACHE_PACKED_KERNEL
+#define CONV_SME_CACHE_PACKED_KERNEL 1
+#endif
+
+#ifndef CONV_SME_PACKED_KERNEL_COPIES
+#define CONV_SME_PACKED_KERNEL_COPIES 19
+#endif
+
+/*
+ * Large packed-weight working sets put substantially more read pressure on
+ * the shared cache hierarchy.  Give each pair of OpenMP workers a private
+ * copy on a 38-core node, while retaining the compact single-copy layout for
+ * smaller kernels.  The decision depends on packed bytes, not benchmark
+ * rows/columns or any complete public test shape.
+ */
+#ifndef CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES
+#define CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES (256U * 1024U)
+#endif
+
+#ifndef CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES
+#define CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES 0
 #endif
 
 /*
@@ -99,6 +139,14 @@ typedef int CONVINT;
 #define CONV_SME_INPUT_PREFETCH_DISTANCE 4
 #endif
 
+#ifndef CONV_SME_INPUT_PREFETCH_LOCALITY
+#define CONV_SME_INPUT_PREFETCH_LOCALITY 2
+#endif
+
+#ifndef CONV_SME_INTERLEAVE_WINDOWS
+#define CONV_SME_INTERLEAVE_WINDOWS 0
+#endif
+
 #ifndef CONV_SME_TAIL_UNROLL
 #define CONV_SME_TAIL_UNROLL 1
 #endif
@@ -120,6 +168,10 @@ typedef int CONVINT;
 
 #ifndef CONV_SME_GUIDED_MIN_TASKS_PER_THREAD
 #define CONV_SME_GUIDED_MIN_TASKS_PER_THREAD 16
+#endif
+
+#ifndef CONV_SME_GUIDED_CHUNK
+#define CONV_SME_GUIDED_CHUNK 1
 #endif
 
 #ifndef CONV_SME_BLOCKS_PER_TASK
@@ -151,6 +203,14 @@ typedef int CONVINT;
 #error "CONV SME guided scheduling threshold must be positive"
 #endif
 
+#if CONV_SME_GUIDED_CHUNK < 1
+#error "CONV SME guided chunk must be positive"
+#endif
+
+#if CONV_SME_INTERLEAVE_WINDOWS != 0 && CONV_SME_INTERLEAVE_WINDOWS != 1
+#error "CONV SME window interleave must be 0 or 1"
+#endif
+
 #if CONV_SME_PREFETCH_ROWS_SMALL < 0 || CONV_SME_PREFETCH_ROWS_MEDIUM < 0 || \
     CONV_SME_PREFETCH_ROWS_LARGE < 0
 #error "CONV SME prefetch row counts must be non-negative"
@@ -163,6 +223,23 @@ typedef int CONVINT;
 
 #if CONV_SME_CARRY_WINDOWS && !CONV_SME_ITERATIVE_WINDOWS
 #error "CONV_SME_CARRY_WINDOWS requires CONV_SME_ITERATIVE_WINDOWS"
+#endif
+
+#if CONV_SME_CACHE_PACKED_KERNEL != 0 && CONV_SME_CACHE_PACKED_KERNEL != 1
+#error "CONV_SME_CACHE_PACKED_KERNEL must be 0 or 1"
+#endif
+
+#if CONV_SME_PACKED_KERNEL_COPIES < 1 || CONV_SME_PACKED_KERNEL_COPIES > 256
+#error "CONV_SME_PACKED_KERNEL_COPIES must be between 1 and 256"
+#endif
+
+#if CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES < 1
+#error "CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES must be positive"
+#endif
+
+#if CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES < 0 || \
+    (CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES % 4) != 0
+#error "CONV SME packed copy padding must be a non-negative float multiple"
 #endif
 
 #if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SME) && \
@@ -193,6 +270,20 @@ static const int conv_sme_vl_64_ready = 0;
 
 #if defined(__ARM_FEATURE_SME) && defined(__ARM_FEATURE_SVE_BITS) && \
     __ARM_FEATURE_SVE_BITS == 512 && CONV_USE_SME
+#if CONV_SME_CACHE_PACKED_KERNEL
+typedef struct {
+    CONVFLOAT* packedKernel;
+    CONVFLOAT* kernelSnapshot;
+    size_t packedBytes;
+    size_t kernelBytes;
+    CONVINT kernelHeight;
+    CONVINT kernelWidth;
+    int packedCopies;
+} ConvSmePackedKernelCache;
+
+static _Thread_local ConvSmePackedKernelCache conv_sme_packed_cache;
+#endif
+
 /*
  * SME 主计算内核。
  *
@@ -208,13 +299,21 @@ static const int conv_sme_vl_64_ready = 0;
  */
 __arm_new("za") __arm_locally_streaming static void
 conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
-                  const CONVFLOAT* __restrict__ packedKernel,
+                  const CONVFLOAT* __restrict__ packedKernelBase,
+                  size_t packedCopyElements, int packedCopies,
                   CONVINT kernelHeight, CONVINT kernelWidth,
                   CONVFLOAT* __restrict__ output, CONVINT outputHeight,
                   CONVINT outputWidth, int useFineTasks)
 {
     const uint32_t tileSize = 16;
     const size_t packedColumnStride = tileSize;
+    const CONVFLOAT* const packedKernel =
+        packedKernelBase +
+        (packedCopies > 1
+             ? (size_t)(((int64_t)omp_get_thread_num() * packedCopies) /
+                        omp_get_num_threads()) *
+                   packedCopyElements
+             : 0);
     /*
      * 中小 kernel 在任务总数足够时使用细粒度 64 列任务；宽 kernel 将相邻
      * 列块保留在同一任务内。前者减少线程收尾差，后者保留顺序访存和缓存
@@ -324,12 +423,20 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                                  CONV_SME_INPUT_PREFETCH_DISTANCE) *
                             inputWidth +
                         outputColStart;
-                    __builtin_prefetch(inputPrefetch, 0, 2);
-                    __builtin_prefetch(inputPrefetch + 32, 0, 2);
-                    __builtin_prefetch(inputPrefetch + 64, 0, 2);
-                    __builtin_prefetch(inputPrefetch + 96, 0, 2);
-                    if (kernelWidth > 65) {
-                        __builtin_prefetch(inputPrefetch + 128, 0, 2);
+                    __builtin_prefetch(inputPrefetch, 0,
+                                       CONV_SME_INPUT_PREFETCH_LOCALITY);
+                    const CONVINT inputTail = inputWidth - outputColStart;
+                    if (inputTail > 47) {
+                        __builtin_prefetch(inputPrefetch + 32, 0,
+                                           CONV_SME_INPUT_PREFETCH_LOCALITY);
+                    }
+                    if (inputTail > 79) {
+                        __builtin_prefetch(inputPrefetch + 64, 0,
+                                           CONV_SME_INPUT_PREFETCH_LOCALITY);
+                    }
+                    if (inputTail > 111) {
+                        __builtin_prefetch(inputPrefetch + 96, 0,
+                                           CONV_SME_INPUT_PREFETCH_LOCALITY);
                     }
                 }
 #endif
@@ -371,7 +478,33 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                 svfloat32_t window3 = zeroWindow;
                 svfloat32_t window4 = zeroWindow;
 #endif
+#if CONV_SME_ASM_DOUBLE_BUFFER
+                int asmUsed = 0;
+                const CONVINT asmGroups =
+                    rowCount == (CONVINT)tileSize && kernelWidth >= 32
+                        ? kernelWidth / 16 - 1
+                        : 0;
+#endif
                 for (; ik + 15 < kernelWidth; ik += 16) {
+#if CONV_SME_ASM_DOUBLE_BUFFER
+                    if (ik == 0 && asmGroups > 0) {
+                        const CONVINT asmCount = asmGroups;
+                        asm volatile(
+                            "mov x0, %[in]\n"
+                            "mov x1, %[pk]\n"
+                            "mov x2, %[groups]\n"
+                            "bl conv_sme_asm_block\n"
+                            :
+                            : [in] "r"(inputRow), [pk] "r"(packedRow),
+                              [groups] "r"(asmCount)
+                            : "memory", "x0", "x1", "x2", "x8", "x9",
+                              "x30", "p0", "z0", "z1", "z2", "z3", "z4",
+                              "z5", "z6", "z7");
+                        asmUsed = 1;
+                        ik = asmGroups * 16 - 16;
+                        continue;
+                    }
+#endif
                     const CONVFLOAT* const inputBase = inputRow + ik;
 #if CONV_SME_ITERATIVE_WINDOWS && CONV_SME_CARRY_WINDOWS
                     const svbool_t finalInputLanes =
@@ -381,7 +514,12 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                                  ik + 16 < kernelWidth)
                             ? allCols
                             : extensionLanes;
+#if CONV_SME_ASM_DOUBLE_BUFFER
+                    if (ik == 0 || asmUsed) {
+                        asmUsed = 0;
+#else
                     if (ik == 0) {
+#endif
                         window0 = svld1_f32(allCols, inputBase);
                         window1 = svld1_f32(allCols, inputBase + tileSize);
                         window2 = svld1_f32(allCols, inputBase + 2 * tileSize);
@@ -443,6 +581,28 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                      * kernel 向右移动一列时，四个 input 窗口也右移一 lane。
                      * EXT 复用相邻向量重叠数据，避免重新执行四个完整 LD1W。
                      */
+#if CONV_SME_INTERLEAVE_WINDOWS
+#define CONV_SME_SLIDE_STEP(SHIFT)                                              \
+                    do {                                                        \
+                        const svfloat32_t kernelValues = svld1_f32(             \
+                            activeRows, packedRow +                            \
+                                            (size_t)(ik + (SHIFT)) *           \
+                                                packedColumnStride);           \
+                        window0 = svext_f32(window0, window1, 1);               \
+                        window1 = svext_f32(window1, window2, 1);               \
+                        svmopa_za32_f32_m(0, activeRows, allCols, kernelValues, \
+                                          window0);                             \
+                        svmopa_za32_f32_m(1, activeRows, allCols, kernelValues, \
+                                          window1);                             \
+                        window2 = svext_f32(window2, window3, 1);               \
+                        window3 = svext_f32(window3, window4, 1);               \
+                        svmopa_za32_f32_m(2, activeRows, allCols, kernelValues, \
+                                          window2);                             \
+                        svmopa_za32_f32_m(3, activeRows, allCols, kernelValues, \
+                                          window3);                             \
+                        window4 = svext_f32(window4, zeroWindow, 1);            \
+                    } while (0)
+#else
 #define CONV_SME_SLIDE_STEP(SHIFT)                                              \
                     do {                                                        \
                         const svfloat32_t kernelValues = svld1_f32(             \
@@ -463,6 +623,7 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
                         svmopa_za32_f32_m(3, activeRows, allCols, kernelValues, \
                                           window3);                             \
                     } while (0)
+#endif
 
 #if !CONV_SME_CARRY_WINDOWS
 #define CONV_SME_SLIDE_FINAL(SHIFT)                                             \
@@ -658,7 +819,107 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
     }
 }
 
+#if CONV_SME_WIDE128_EXPERIMENT
+/*
+ * Isolated 16x128 experiment.  It deliberately keeps the original
+ * physical-row/column accumulation order, but uses eight ZA tiles so one
+ * packed kernel vector is reused across 128 output columns.
+ */
+__arm_new("za") __arm_locally_streaming static void
+conv2d_sme_worker_wide128(const CONVFLOAT* __restrict__ input,
+                          CONVINT inputWidth,
+                          const CONVFLOAT* __restrict__ packedKernelBase,
+                          size_t packedCopyElements, int packedCopies,
+                          CONVINT kernelHeight, CONVINT kernelWidth,
+                          CONVFLOAT* __restrict__ output,
+                          CONVINT outputHeight, CONVINT outputWidth)
+{
+    const CONVINT tile = 16;
+    const CONVFLOAT* const packedKernel =
+        packedKernelBase +
+        (packedCopies > 1
+             ? (size_t)(((int64_t)omp_get_thread_num() * packedCopies) /
+                        omp_get_num_threads()) * packedCopyElements
+             : 0);
+    const CONVINT rowTiles = (outputHeight + tile - 1) / tile;
+    const CONVINT full128 = outputWidth / (8 * tile);
+    const CONVINT totalTasks = rowTiles * (full128 + (outputWidth % (8 * tile) != 0));
+
+#pragma omp for schedule(static)
+    for (CONVINT task = 0; task < totalTasks; ++task) {
+        const CONVINT parts = full128 + (outputWidth % (8 * tile) != 0);
+        const CONVINT rowTile = task / parts;
+        const CONVINT part = task % parts;
+        const CONVINT rowStart = rowTile * tile;
+        const CONVINT rowCount = outputHeight - rowStart < tile
+                                     ? outputHeight - rowStart : tile;
+        const svbool_t rows = svwhilelt_b32(0, (uint64_t)rowCount);
+        const CONVINT colStart = part < full128 ? part * 8 * tile : full128 * 8 * tile;
+        const CONVINT colEnd = part < full128 ? colStart + 8 * tile : outputWidth;
+
+        for (CONVINT col = colStart; col < colEnd; col += 8 * tile) {
+            const CONVINT colsThis = colEnd - col >= 8 * tile ? 8 * tile : colEnd - col;
+            if (colsThis == 8 * tile) {
+                const svbool_t all = svptrue_b32();
+                svzero_za();
+                for (CONVINT physical = 0;
+                     physical < kernelHeight + rowCount - 1; ++physical) {
+                    const CONVFLOAT* in = input + (size_t)(rowStart + physical) * inputWidth + col;
+                    const CONVFLOAT* pk = packedKernel + (size_t)physical * kernelWidth * tile;
+                    for (CONVINT ik = 0; ik < kernelWidth; ++ik) {
+                        const svfloat32_t kv = svld1_f32(rows, pk + (size_t)ik * tile);
+                        const CONVFLOAT* base = in + ik;
+                        svmopa_za32_f32_m(0, rows, all, kv, svld1_f32(all, base + 0 * tile));
+                        svmopa_za32_f32_m(1, rows, all, kv, svld1_f32(all, base + 1 * tile));
+                        svmopa_za32_f32_m(2, rows, all, kv, svld1_f32(all, base + 2 * tile));
+                        svmopa_za32_f32_m(3, rows, all, kv, svld1_f32(all, base + 3 * tile));
+                        svmopa_za32_f32_m(4, rows, all, kv, svld1_f32(all, base + 4 * tile));
+                        svmopa_za32_f32_m(5, rows, all, kv, svld1_f32(all, base + 5 * tile));
+                        svmopa_za32_f32_m(6, rows, all, kv, svld1_f32(all, base + 6 * tile));
+                        svmopa_za32_f32_m(7, rows, all, kv, svld1_f32(all, base + 7 * tile));
+                    }
+                }
+                for (CONVINT r = 0; r < rowCount; ++r) {
+                    CONVFLOAT* out = output + (size_t)(rowStart + r) * outputWidth + col;
+                    svst1_hor_za32(0, (uint32_t)r, all, out + 0 * tile);
+                    svst1_hor_za32(1, (uint32_t)r, all, out + 1 * tile);
+                    svst1_hor_za32(2, (uint32_t)r, all, out + 2 * tile);
+                    svst1_hor_za32(3, (uint32_t)r, all, out + 3 * tile);
+                    svst1_hor_za32(4, (uint32_t)r, all, out + 4 * tile);
+                    svst1_hor_za32(5, (uint32_t)r, all, out + 5 * tile);
+                    svst1_hor_za32(6, (uint32_t)r, all, out + 6 * tile);
+                    svst1_hor_za32(7, (uint32_t)r, all, out + 7 * tile);
+                }
+            }
+        }
+
+        if (part == full128 && outputWidth % (8 * tile) != 0) {
+            for (CONVINT col = colStart; col < outputWidth; col += tile) {
+                const CONVINT n = outputWidth - col < tile ? outputWidth - col : tile;
+                const svbool_t cols = svwhilelt_b32(0, (uint64_t)n);
+                svzero_za();
+                for (CONVINT physical = 0;
+                     physical < kernelHeight + rowCount - 1; ++physical) {
+                    const CONVFLOAT* in = input + (size_t)(rowStart + physical) * inputWidth + col;
+                    const CONVFLOAT* pk = packedKernel + (size_t)physical * kernelWidth * tile;
+                    for (CONVINT ik = 0; ik < kernelWidth; ++ik) {
+                        const svfloat32_t kv = svld1_f32(rows, pk + (size_t)ik * tile);
+                        svmopa_za32_f32_m(0, rows, cols, kv,
+                                          svld1_f32(cols, in + ik));
+                    }
+                }
+                for (CONVINT r = 0; r < rowCount; ++r) {
+                    svst1_hor_za32(0, (uint32_t)r, cols,
+                                   output + (size_t)(rowStart + r) * outputWidth + col);
+                }
+            }
+        }
+    }
+}
 #endif
+
+#endif
+
 
 void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT inputWidth,
             const CONVFLOAT* __restrict__ kernel, CONVINT kernelHeight, CONVINT kernelWidth,
@@ -690,16 +951,70 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
         packedGroups <= SIZE_MAX / packedGroupElements &&
         packedGroups * packedGroupElements <= SIZE_MAX / sizeof(CONVFLOAT)) {
         const size_t packedElements = packedGroups * packedGroupElements;
-        const size_t packedBytes =
-            packedElements * sizeof(CONVFLOAT);
+        const size_t packedBytes = packedElements * sizeof(CONVFLOAT);
+        const size_t packedCopyPadElements =
+            (size_t)CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES / sizeof(CONVFLOAT);
+        const size_t packedCopyElements =
+            packedElements <= SIZE_MAX - packedCopyPadElements
+                ? packedElements + packedCopyPadElements
+                : 0;
+        const size_t kernelElements =
+            (size_t)kernelHeight * (size_t)kernelWidth;
+        const size_t kernelBytes = kernelElements * sizeof(CONVFLOAT);
+        const int maximumPackedCopies = omp_get_max_threads();
+        const int configuredPackedCopies =
+            packedBytes >= (size_t)CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES
+                ? CONV_SME_PACKED_KERNEL_COPIES
+                : 1;
+        const int requestedPackedCopies =
+            configuredPackedCopies < maximumPackedCopies
+                ? configuredPackedCopies
+                : maximumPackedCopies;
+        const int packedCopies =
+            requestedPackedCopies > 0 ? requestedPackedCopies : 1;
+        const size_t packedTotalBytes =
+            packedCopyElements > 0 &&
+                    packedCopyElements <=
+                        SIZE_MAX / sizeof(CONVFLOAT) / (size_t)packedCopies
+                ? packedCopyElements * (size_t)packedCopies * sizeof(CONVFLOAT)
+                : 0;
+        int packedKernelNeedsBuild = 1;
+        CONVFLOAT* kernelSnapshot = NULL;
 #if CONV_SME_ALIGNED_PACKING
         /* 一个 packed 16-lane FP32 向量恰好为 64 字节，与缓存行对齐。 */
-        CONVFLOAT* const packedKernel =
-            (CONVFLOAT*)aligned_alloc(64, packedBytes);
+        CONVFLOAT* packedKernel = NULL;
 #else
-        CONVFLOAT* const packedKernel =
-            (CONVFLOAT*)malloc(packedBytes);
+        CONVFLOAT* packedKernel = NULL;
 #endif
+#if CONV_SME_CACHE_PACKED_KERNEL
+        if (conv_sme_packed_cache.packedKernel != NULL &&
+            conv_sme_packed_cache.kernelSnapshot != NULL &&
+            conv_sme_packed_cache.packedBytes == packedTotalBytes &&
+            conv_sme_packed_cache.kernelBytes == kernelBytes &&
+            conv_sme_packed_cache.kernelHeight == kernelHeight &&
+            conv_sme_packed_cache.kernelWidth == kernelWidth &&
+            conv_sme_packed_cache.packedCopies == packedCopies &&
+            memcmp(conv_sme_packed_cache.kernelSnapshot, kernel, kernelBytes) ==
+                0) {
+            packedKernel = conv_sme_packed_cache.packedKernel;
+            packedKernelNeedsBuild = 0;
+        }
+#endif
+        if (packedKernel == NULL && packedTotalBytes > 0) {
+#if CONV_SME_ALIGNED_PACKING
+            packedKernel = (CONVFLOAT*)aligned_alloc(64, packedTotalBytes);
+#else
+            packedKernel = (CONVFLOAT*)malloc(packedTotalBytes);
+#endif
+#if CONV_SME_CACHE_PACKED_KERNEL
+            if (packedKernel != NULL) {
+                kernelSnapshot = (CONVFLOAT*)malloc(kernelBytes);
+                if (kernelSnapshot != NULL) {
+                    memcpy(kernelSnapshot, kernel, kernelBytes);
+                }
+            }
+#endif
+        }
         if (packedKernel != NULL) {
             /*
              * 调度选择只依赖 kernel 宽度、输出 tile 数和线程数：
@@ -746,36 +1061,93 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
             omp_get_schedule(&previousSchedule, &previousChunkSize);
             omp_set_schedule(useGuidedSchedule ? omp_sched_guided
                                                : omp_sched_static,
-                             useGuidedSchedule ? 1 : 0);
+                             useGuidedSchedule ? CONV_SME_GUIDED_CHUNK : 0);
 #pragma omp parallel
             {
                 /*
                  * 多线程并行打包 kernel。jk = physicalRow-outputRow 保持每个
                  * 输出元素原有的 jk -> ik 累加顺序；边界外系数填 0。
                  */
+                if (packedKernelNeedsBuild) {
+                    if (packedCopies > 1) {
 #pragma omp for schedule(static)
-                for (size_t group = 0; group < packedGroups; ++group) {
-                    const CONVINT physicalRow =
-                        (CONVINT)(group / (size_t)kernelWidth);
-                    const CONVINT ik = (CONVINT)(group % (size_t)kernelWidth);
-                    CONVFLOAT* const packedValues = packedKernel + group * tileSize;
-                    for (CONVINT outputRow = 0; outputRow < (CONVINT)tileSize;
-                         ++outputRow) {
-                        const CONVINT jk = physicalRow - outputRow;
-                        packedValues[outputRow] =
-                            (jk >= 0 && jk < kernelHeight)
-                                ? kernel[(size_t)jk * kernelWidth + ik]
-                                : 0.0f;
+                        for (int packedCopy = 0; packedCopy < packedCopies;
+                             ++packedCopy) {
+                            CONVFLOAT* const threadPackedKernel =
+                                packedKernel +
+                                (size_t)packedCopy * packedCopyElements;
+                            for (size_t group = 0; group < packedGroups;
+                                 ++group) {
+                                const CONVINT physicalRow =
+                                    (CONVINT)(group / (size_t)kernelWidth);
+                                const CONVINT ik =
+                                    (CONVINT)(group % (size_t)kernelWidth);
+                                CONVFLOAT* const packedValues =
+                                    threadPackedKernel + group * tileSize;
+                                for (CONVINT outputRow = 0;
+                                     outputRow < (CONVINT)tileSize;
+                                     ++outputRow) {
+                                    const CONVINT jk = physicalRow - outputRow;
+                                    packedValues[outputRow] =
+                                        (jk >= 0 && jk < kernelHeight)
+                                            ? kernel[(size_t)jk * kernelWidth +
+                                                     ik]
+                                            : 0.0f;
+                                }
+                            }
+                        }
+                    } else {
+#pragma omp for schedule(static)
+                        for (size_t group = 0; group < packedGroups; ++group) {
+                            const CONVINT physicalRow =
+                                (CONVINT)(group / (size_t)kernelWidth);
+                            const CONVINT ik =
+                                (CONVINT)(group % (size_t)kernelWidth);
+                            CONVFLOAT* const packedValues =
+                                packedKernel + group * tileSize;
+                            for (CONVINT outputRow = 0;
+                                 outputRow < (CONVINT)tileSize; ++outputRow) {
+                                const CONVINT jk = physicalRow - outputRow;
+                                packedValues[outputRow] =
+                                    (jk >= 0 && jk < kernelHeight)
+                                        ? kernel[(size_t)jk * kernelWidth + ik]
+                                        : 0.0f;
+                            }
+                        }
                     }
                 }
 
-                conv2d_sme_worker(input, inputWidth, packedKernel, kernelHeight,
+#if CONV_SME_WIDE128_EXPERIMENT
+                conv2d_sme_worker_wide128(
+                    input, inputWidth, packedKernel, packedCopyElements,
+                    packedCopies, kernelHeight, kernelWidth, output,
+                    outputHeight, outputWidth);
+#else
+                conv2d_sme_worker(input, inputWidth, packedKernel,
+                                  packedCopyElements, packedCopies, kernelHeight,
                                   kernelWidth, output, outputHeight, outputWidth,
                                   useFineTasks);
+#endif
             }
             /* 恢复调用者原有 OpenMP runtime 调度状态，避免污染外部程序。 */
             omp_set_schedule(previousSchedule, previousChunkSize);
+#if CONV_SME_CACHE_PACKED_KERNEL
+            if (packedKernelNeedsBuild && kernelSnapshot != NULL) {
+                free(conv_sme_packed_cache.packedKernel);
+                free(conv_sme_packed_cache.kernelSnapshot);
+                conv_sme_packed_cache.packedKernel = packedKernel;
+                conv_sme_packed_cache.kernelSnapshot = kernelSnapshot;
+                conv_sme_packed_cache.packedBytes = packedTotalBytes;
+                conv_sme_packed_cache.kernelBytes = kernelBytes;
+                conv_sme_packed_cache.kernelHeight = kernelHeight;
+                conv_sme_packed_cache.kernelWidth = kernelWidth;
+                conv_sme_packed_cache.packedCopies = packedCopies;
+            } else if (packedKernelNeedsBuild) {
+                free(packedKernel);
+            }
+#else
             free(packedKernel);
+#endif
             return;
         }
     }
@@ -1288,6 +1660,9 @@ void conv2d(const CONVFLOAT* __restrict__ input, CONVINT inputHeight, CONVINT in
 #undef CONV_SME_ITERATIVE_WINDOWS
 #undef CONV_SME_CARRY_WINDOWS
 #undef CONV_SME_ALIGNED_PACKING
+#undef CONV_SME_CACHE_PACKED_KERNEL
+#undef CONV_SME_PACKED_KERNEL_COPIES
+#undef CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES
 #undef CONV_SME_BLOCKS_PER_TASK
 #undef CONV_SME_FINE_TASK_MIN_PER_THREAD
 #undef CONV_SME_INPUT_PREFETCH_DISTANCE
