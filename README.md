@@ -24,6 +24,7 @@ Conv/
     ├── README.md          # CONV 赛题说明副本
     ├── bench_conv.c       # 测试程序副本，仍然禁止修改
     ├── conv2d.c           # 实际进行性能优化的核心代码
+    ├── conv2d_dispatch.c  # 三种编译期预取内核的通用工作集分派
     └── run.sh             # 官方环境一键编译和运行脚本
 ```
 
@@ -48,7 +49,7 @@ Conv/
 
 所有实际优化均在 `conv/` 中完成：
 
-- 主要修改目标为 `conv/conv2d.c` 中的 `conv2d` 函数；
+- 主要修改目标为 `conv/conv2d.c` 中的计算内核；`conv2d_dispatch.c` 只在进入热循环前选择编译期专门化版本；
 - `conv/bench_conv.c` 是测试程序，不得修改；
 - `conv/run.sh` 使用官方鲲鹏环境验证过的编译参数完成编译和四项测试；
 - 每次优化都必须先通过正确性验证，再比较性能。
@@ -87,17 +88,22 @@ cd conv
 bash run.sh
 ```
 
-`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对 `conv2d.c` 启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；中等 kernel 的大任务采用等重 64 列 static 任务，宽 kernel 保留 coarse + guided 调度，小任务自动回退低开销分区。GCC 模式保留显式 SVE 回退。默认绑定 NUMA 7，编译器和节点均可显式切换：
+`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对参赛内核启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；对内容未变化的只读 kernel 复用其打包格式，每次调用仍逐字节校验权重，权重变化时立即重建，不缓存输出结果。packed 权重达到 256 KiB 后会按线程组建立受控副本，以降低大 kernel 多核共享读取造成的缓存争用；小工作集继续只保留一份。中等 kernel 的大任务采用等重 64 列 static 任务，宽 kernel 保留 coarse + guided 调度，小任务自动回退低开销分区。BiSheng 构建会生成 L2-keep、streaming 和 wide（三者分别对应普通局部性、流式输入及宽 kernel 较远距离输入预取）三个专门化 worker，并由 `conv2d_dispatch.c` 按输入方向、工作集大小和通用 kernel 宽度类别在热循环外选择；这避免了每个 physical row 的运行时判断。GCC 模式保留显式 SVE 回退。默认会在普通计算 NUMA 候选中采样两秒 CPU 负载，选定一个节点后让四个 Case 始终绑定该节点；也可显式指定节点或候选列表：
 
 ```sh
-COMPILER=bisheng NUMA_NODE=7 bash run.sh
+COMPILER=bisheng bash run.sh
+COMPILER=bisheng NUMA_NODE=9 bash run.sh
+COMPILER=bisheng NUMA_CANDIDATES=7,3,5,9 bash run.sh
+COMPILER=bisheng NUMA_NODE=7 TEST_RUNS=7 bash run.sh
 COMPILER=gcc NUMA_NODE=7 bash run.sh
 ```
+
+提交脚本默认对每个 Case 计时 5 次并报告平均值，以减小共享服务器瞬时负载造成的榜单波动；可通过 `TEST_RUNS` 使用其他正整数。每个 Case 仍只绑定同一个 NUMA 节点，线程上限不变。
 
 ## 建议工作流程
 
 1. 使用 `conv_init/` 建立并保存初始性能基线。
-2. 仅在 `conv/conv2d.c` 中实施优化。
+2. 仅在 `conv/conv2d.c` 与计算路径辅助文件 `conv/conv2d_dispatch.c` 中实施优化。
 3. 使用未修改的 `conv/bench_conv.c` 验证正确性。
 4. 在相同编译器、线程数和 NUMA 绑定下重复测试并比较性能。
 5. 检查 `conv/` 与 `conv_init/` 的差异，确认测试程序和赛题说明未被改动。
