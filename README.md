@@ -88,7 +88,7 @@ cd conv
 bash run.sh
 ```
 
-`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对参赛内核启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；对内容未变化的只读 kernel 复用其打包格式，每次调用仍逐字节校验权重，权重变化时立即重建，不缓存输出结果。packed 权重达到 256 KiB 后会按线程组建立受控副本，以降低大 kernel 多核共享读取造成的缓存争用；小工作集继续只保留一份。中等 kernel 的大任务采用等重 64 列 static 任务，宽 kernel 保留 coarse + guided 调度，小任务自动回退低开销分区。BiSheng 构建会生成 L2-keep、streaming 和 wide（三者分别对应普通局部性、流式输入及宽 kernel 较远距离输入预取）三个专门化 worker，并由 `conv2d_dispatch.c` 按输入方向、工作集大小和通用 kernel 宽度类别在热循环外选择；这避免了每个 physical row 的运行时判断。GCC 模式保留显式 SVE 回退。默认会在普通计算 NUMA 候选中采样两秒 CPU 负载，选定一个节点后让四个 Case 始终绑定该节点；也可显式指定节点或候选列表：
+`run.sh` 默认加载 BiSheng 5.0.0.2，以 `-O3` 编译未修改的测试程序，并仅对参赛内核启用 `-ffast-math`。主路径使用 512 位 SVE/SME、四个 ZA tile、卷积核打包、逐 lane 滚动窗口和跨核列组窗口复用；对内容未变化的只读 kernel 复用其打包格式，每次调用仍逐字节校验权重，权重变化时立即重建，不缓存输出结果。packed 权重达到 256 KiB 后会按线程组建立受控副本，以降低大 kernel 多核共享读取造成的缓存争用；小工作集继续只保留一份。中等 kernel 的大任务采用等重 64 列 static 任务，宽 kernel 保留 coarse + guided 调度，小任务自动回退低开销分区。BiSheng 构建会生成 L2-keep、streaming 和 wide（三者分别对应普通局部性、流式输入及宽 kernel 较远距离输入预取）三个专门化 worker，并由 `conv2d_dispatch.c` 按输入方向、工作集大小和通用 kernel 宽度类别在热循环外选择；这避免了每个 physical row 的运行时判断。GCC 模式保留显式 SVE 回退。默认固定绑定经复测最稳定的普通计算 NUMA 5；其他主机可用 `NUMA_NODE=auto` 恢复启动时两秒负载采样，也可显式指定节点或候选列表：
 
 ```sh
 COMPILER=bisheng bash run.sh

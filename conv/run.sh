@@ -20,7 +20,9 @@ export OMP_DYNAMIC="${OMP_DYNAMIC:-false}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
 
-NUMA_NODE="${NUMA_NODE:-auto}"
+# NUMA 5 is the most repeatable ordinary DDR node observed on the contest
+# server. Keep auto-selection available for other hosts via NUMA_NODE=auto.
+NUMA_NODE="${NUMA_NODE:-5}"
 NUMA_CANDIDATES="${NUMA_CANDIDATES:-7,3,5,11,13,15,9,2,4,6,8,10,12,14}"
 # Optional explicit memory NUMA node for controlled CPU-NUMA/HBM experiments.
 # Empty (the default) preserves the competition's single-node `-N` policy.
