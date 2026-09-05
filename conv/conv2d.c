@@ -91,7 +91,7 @@ typedef int CONVINT;
  * rows/columns or any complete public test shape.
  */
 #ifndef CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES
-#define CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES (256U * 1024U)
+#define CONV_SME_PACKED_KERNEL_COPY_MIN_BYTES (128U * 1024U)
 #endif
 
 #ifndef CONV_SME_PACKED_KERNEL_COPY_PAD_BYTES
