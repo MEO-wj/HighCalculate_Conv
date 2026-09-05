@@ -28,6 +28,13 @@ void conv2d(const CONVFLOAT* input, CONVINT inputHeight, CONVINT inputWidth,
             CONVFLOAT* output)
 {
     const size_t inputElements = (size_t)inputHeight * (size_t)inputWidth;
+    /*
+     * Non-temporal (locality=0) input prefetch is only engaged for genuinely
+     * streaming-size portrait inputs, where the KH-1 overlapping input rows
+     * no longer survive in cache between row tiles.  64 MiB of fp32 is the
+     * streaming class; smaller inputs keep the temporal worker, which reuses
+     * the overlap.
+     */
     const size_t streamingInputThreshold =
         (size_t)(64U * 1024U * 1024U) / sizeof(CONVFLOAT);
     /*

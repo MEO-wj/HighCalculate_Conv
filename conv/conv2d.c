@@ -179,6 +179,19 @@ typedef int CONVINT;
 #endif
 
 /*
+ * Column-major task order.  Default row-major order makes one thread sweep a
+ * full 64-column row of output tiles before advancing 16 rows, so the KH-1
+ * overlapping input rows (a full-width working set) fall out of L2 and get
+ * re-read from DRAM ~(KH+15)/16 times.  Column-major instead walks one narrow
+ * column strip down through all row tiles, keeping the KH-1 row overlap (only
+ * a few hundred bytes wide) resident in L1 and collapsing the vertical input
+ * re-read to ~1x.  The accumulation order per output is unchanged.
+ */
+#ifndef CONV_SME_COLUMN_MAJOR
+#define CONV_SME_COLUMN_MAJOR 0
+#endif
+
+/*
  * Fine static tasks remove the coarse column-partition tail on sufficiently
  * large problems.  Small problems retain the lower-overhead partition path;
  * wide kernels retain the separately validated guided schedule.
@@ -343,8 +356,15 @@ conv2d_sme_worker(const CONVFLOAT* __restrict__ input, CONVINT inputWidth,
     /* schedule(runtime) 由 conv2d 根据工作量统一设为 static 或 guided。 */
 #pragma omp for schedule(runtime)
     for (CONVINT task = 0; task < totalTasks; ++task) {
+#if CONV_SME_COLUMN_MAJOR
+        /* 列优先：task 先按列分区、再按行 tile 递增，让同一线程沿窄列带
+         * 垂直扫过相邻 row tile，KH-1 行重叠工作集常驻 L1，消除垂直重读。 */
+        const CONVINT rowTileIndex = task % totalRowTiles;
+        const CONVINT colPartition = task / totalRowTiles;
+#else
         const CONVINT rowTileIndex = task / tasksPerRowTile;
         const CONVINT colPartition = task % tasksPerRowTile;
+#endif
         const CONVINT outputRowStart = rowTileIndex * (CONVINT)tileSize;
         const CONVINT rowCount =
             outputHeight - outputRowStart < (CONVINT)tileSize
